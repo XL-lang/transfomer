@@ -1,4 +1,4 @@
-from collections.abc import dict_values
+
 
 import numpy as np
 import torch
@@ -10,11 +10,15 @@ from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
 from torchtext.datasets import Multi30k
 
+src_len = 5  # length of source
+tgt_len = 5  # length of target
 
-d_model = 0
-d_k = 0
-d_v = 0
-n_heads = 0
+## 模型参数
+d_model = 512  # Embedding Size
+d_ff = 2048  # FeedForward dimension
+d_k = d_v = 64  # dimension of K(=Q), V
+n_layers = 6  # number of Encoder of Decoder Layer
+n_heads = 8  # number of heads in Multi-Head Attention
 
 src_tokenizer = get_tokenizer('spacy', language='en_core_web_sm')
 tgt_tokenizer = get_tokenizer('spacy', language='fr_core_news_sm')
@@ -54,8 +58,8 @@ class ScaledDotProductAttention(nn.Module):
         :param Q: [batch_size, n_heads,len_q,d_k] [批次大小， 多头数量， 查询队列长度, 键特征长度]
         :param K: [batch_size, n_heads, len_k, d_k] [批次大小， 多头数量， 键长度, 键特征长度]
         :param V:[批次大小， 多头数量， 键长度, 值特征长度]
-        :param attn_mask:？
-        :return:
+        :param attn_mask: [batch_size, n_heads, len_q, len_k]
+        :return: context, attn
         """
         scores =  torch.matmul(Q,K.transpose(-1,-2))/np.sqrt(K.shape[-1])  # [batch_size, n_heads, len_q, len_k]
         scores.masked_fill(attn_mask, -1e9)
@@ -84,6 +88,61 @@ class MultiHeadAttention(nn.Module):
 
         # 先映射，后分头
         q_s = self.W_Q(Q).view(batch_size, -1, n_heads, d_k).transpose(1,2) # [batch_size, n_heads, len_q, d_k]
+        k_s = self.W_K(K).view(batch_size, -1, n_heads, d_k).transpose(1,2) # [batch_size, n_heads, len_k, d_k]
+        v_s = self.W_V(V).view(batch_size, -1, n_heads, d_v).transpose(1,2) # [batch_size, n_heads, len_v, d_v]
+
+        # 复制attention mask到每个头
+        attn_mask = attn_mask.unsqueeze(1).repeat(1, n_heads, 1, 1) # [batch_size, n_heads, len_q, len_k]
+
+        # 通过scaled dot-product attention
+        context, attn = ScaledDotProductAttention()(q_s, k_s, v_s, attn_mask)
+        context = context.transpose(1,2).contiguous().view(batch_size, -1, n_heads*d_v) # [batch_size, len_q, n_heads*d_v]
+        output = self.linear(context) # [batch_size, len_q, d_model]
+        return self.layer_norm(output + residual), attn
+
+
+
+# TODO: Position-wise Feedforward Networks
+class PositionwiseFeedforward(nn.Module):
+    def __init__(self):
+        super(PositionwiseFeedforward,self).__init__()
+        self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
+        self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def forward(self, inputs):
+        residual = inputs # [batch_size, len_q, d_model]
+        output = nn.ReLU()(self.conv1(inputs.transpose(1,2)))  # [batch_size, d_ff, len_q]
+        output = self.conv2(output).transpose(1,2) # [batch_size, len_q, d_model]
+        return self.layer_norm(output + residual)
+
+def get_attn_pad_mask(seq_q, seq_k):
+    """
+    :param seq_q: [batch_size, len_q]
+    :param seq_k: [batch_size, len_k]
+    :return: pad_mask: [batch_size, len_q, len_k]
+    """
+    batch_size, len_q = seq_q.size()
+    batch_size, len_k = seq_k.size()
+    pad_attn_mask =  seq_k.data.eq(0).unsqueeze(1) # [batch_size, 1, len_k]
+    return pad_attn_mask.expand(batch_size, len_q, len_k) # [batch_size, len_q, len_k]
+
+class PositionalEncoding(nn.Module):
+    def __init__(self,d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding,self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0,1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
+
 
 
 
