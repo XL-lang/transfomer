@@ -30,7 +30,7 @@ def yield_tokens(data_iter, tokenizer):
         yield tokenizer(tgt_sentence)
 
 # 下载和加载 Multi30k 数据集
-train_iter = Multi30k(split='train', language_pair=('en', 'fr'))
+train_iter = Multi30k(split='train', language_pair=('en', 'de'))
 
 # 创建词汇表
 src_vocab = build_vocab_from_iterator(yield_tokens(train_iter, src_tokenizer), specials=["<unk>", "<pad>", "<bos>", "<eos>"])
@@ -42,11 +42,11 @@ tgt_vocab.set_default_index(tgt_vocab["<unk>"])
 
 
 
-def mak_batch(sentences):
+def make_batch(sentences):
     input_batch = [[src_vocab[n] for n in sentences[0].split()]]
     output_batch = [[tgt_vocab[n] for n in sentences[1].split()]]
     target_batch = [[tgt_vocab[n] for n in sentences[1].split()]]
-    return  torch.LongTensor(input_batch),torch
+    return  torch.LongTensor(input_batch),torch.LongTensor(output_batch),torch.LongTensor(target_batch)
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -140,10 +140,142 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
+        """
+
+        :param x:[seq_len, batch_size, d_model]
+        :return:
+        """
         x = x + self.pe[:x.size(0), :]
         return self.dropout(x)
 
 
+class EncoderLayer(nn.Module):
+    def __init__(self):
+        super(EncoderLayer, self).__init__()
+        self.enc_self_attn = MultiHeadAttention()
+        self.pos_ffn = PositionwiseFeedforward()
+
+    def forward(self, enc_inputs, enc_self_attn_mask):
+        """
+        :param enc_inputs: [batch_size, len_q, d_model]
+        :param enc_self_attn_mask: [batch_size, len_q, len_k]
+        :return: enc_outputs:
+        """
+        enc_outputs, attn = self.enc_self_attn(enc_inputs, enc_inputs, enc_inputs, enc_self_attn_mask)
+        enc_outputs = self.pos_ffn(enc_outputs)
+        return enc_outputs, attn
+
+class Encoder(nn.Module):
+    def __init__(self):
+        super(Encoder,self).__init__()
+        self.src_emb = nn.Embedding(len(src_vocab), d_model)
+        self.pos_emb = PositionalEncoding(d_model)
+        self.layers = nn.ModuleList([EncoderLayer() for _ in range(n_layers)])
+
+    def forward(self, enc_inputs):
+        """
+        :param enc_inputs: [batch_size, src_len]
+        :return: enc_outputs: [batch_size, src_len, d_model]
+        """
+        enc_outputs = self.src_emb(enc_inputs)
+        enc_outputs = self.pos_emb(enc_outputs.transpose(0,1)).transpose(0,1)
+
+        enc_self_attn_mask = get_attn_pad_mask(enc_inputs, enc_inputs)
+        enc_self_attns = []
+        for layer in self.layers:
+            enc_outputs, enc_self_attn = layer(enc_outputs, enc_self_attn_mask)
+            enc_self_attns.append(enc_self_attn)
+        return enc_outputs, enc_self_attns
+
+class DecoderLayer(nn.Module):
+    def __init__(self):
+        super(DecoderLayer,self).__init__()
+        self.dec_self_attn = MultiHeadAttention()
+        self.dec_enc_attn = MultiHeadAttention()
+        self.pos_ffn = PositionwiseFeedforward()
+
+    def forward(self, dec_inputs, enc_outputs, dec_self_attn_mask, dec_enc_attn_mask):
+
+        dec_outputs, dec_self_attn = self.dec_self_attn(dec_inputs, dec_inputs, dec_inputs, dec_self_attn_mask)
+        dec_outputs, dec_enc_attn = self.dec_enc_attn(dec_outputs, enc_outputs, enc_outputs, dec_enc_attn_mask)
+        dec_outputs = self.pos_ffn(dec_outputs)
+        return dec_outputs, dec_self_attn, dec_enc_attn
+
+class Decoder(nn.Module):
+    def __init__(self):
+        super(Decoder,self).__init__()
+        self.tgt_emb = nn.Embedding(len(tgt_vocab), d_model)
+        self.pos_emb = PositionalEncoding(d_model)
+        self.layers = nn.ModuleList([DecoderLayer() for _ in range(n_layers)])
+
+    def forward(self,dec_inputs, enc_inputs, enc_outputs):
+
+        dec_outputs = self.tgt_emb(dec_inputs)
+        dec_outputs = self.pos_emb(dec_outputs.transpose(0,1)).transpose(0,1)
+
+        dec_self_attn_pad_mask = get_attn_pad_mask(dec_inputs, dec_inputs)
+        dec_self_attn_subsequent_mask = torch.gt(get_attn_pad_mask(dec_inputs, dec_inputs), 0)
+        dec_self_attn_mask = torch.gt((dec_self_attn_pad_mask + dec_self_attn_subsequent_mask), 0)
+
+        dec_enc_attn_mask = get_attn_pad_mask(dec_inputs, enc_inputs)
+
+        dec_self_attns, dec_enc_attns = [], []
+        for layer in self.layers:
+            dec_outputs, dec_self_attn, dec_enc_attn = layer(dec_outputs, enc_outputs, dec_self_attn_mask, dec_enc_attn_mask)
+            dec_self_attns.append(dec_self_attn)
+            dec_enc_attns.append(dec_enc_attn)
+        return dec_outputs, dec_self_attns, dec_enc_attns
+
+## 1. 从整体网路结构来看，分为三个部分：编码层，解码层，输出层
+class Transformer(nn.Module):
+    def __init__(self):
+        super(Transformer, self).__init__()
+        self.encoder = Encoder()  ## 编码层
+        self.decoder = Decoder()  ## 解码层
+        self.projection = nn.Linear(d_model, len(tgt_vocab), bias=False) ## 输出层 d_model 是我们解码层每个token输出的维度大小，之后会做一个 tgt_vocab_size 大小的softmax
+    def forward(self, enc_inputs, dec_inputs):
+        enc_outputs, enc_self_attns = self.encoder(enc_inputs)
+        dec_outputs, dec_self_attns, dec_enc_attns = self.decoder(dec_inputs, enc_inputs, enc_outputs)
+        dec_logits = self.projection(dec_outputs) # dec_logits : [batch_size x src_vocab_size x tgt_vocab_size]
+        return dec_logits.view(-1, dec_logits.size(-1)), enc_self_attns, dec_self_attns, dec_enc_attns
 
 
+if __name__ == '__main__':
 
+    ## 句子的输入部分，
+    sentences = ['ich mochte ein bier P', 'S i want a beer', 'i want a beer E']
+
+
+    # Transformer Parameters
+    # Padding Should be Zero
+    ## 构建词表
+    src_vocab = {'P': 0, 'ich': 1, 'mochte': 2, 'ein': 3, 'bier': 4}
+    src_vocab_size = len(src_vocab)
+
+    tgt_vocab = {'P': 0, 'i': 1, 'want': 2, 'a': 3, 'beer': 4, 'S': 5, 'E': 6}
+    tgt_vocab_size = len(tgt_vocab)
+
+    src_len = 5 # length of source
+    tgt_len = 5 # length of target
+
+    ## 模型参数
+    d_model = 512  # Embedding Size
+    d_ff = 2048  # FeedForward dimension
+    d_k = d_v = 64  # dimension of K(=Q), V
+    n_layers = 6  # number of Encoder of Decoder Layer
+    n_heads = 8  # number of heads in Multi-Head Attention
+
+    model = Transformer()
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    enc_inputs, dec_inputs, target_batch = make_batch(sentences)
+
+    for epoch in range(20):
+        optimizer.zero_grad()
+        outputs, enc_self_attns, dec_self_attns, dec_enc_attns = model(enc_inputs, dec_inputs)
+        loss = criterion(outputs, target_batch.contiguous().view(-1))
+        print('Epoch:', '%04d' % (epoch + 1), 'cost =', '{:.6f}'.format(loss))
+        loss.backward()
+        optimizer.step()
